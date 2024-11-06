@@ -1,0 +1,99 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: node-token-exchange-filter
+  namespace: default
+spec:
+  workloadSelector:
+    labels:
+      app: node-demo  
+  configPatches:
+    - applyTo: HTTP_FILTER
+      match:
+        context: SIDECAR_INBOUND
+        listener:
+          portNumber: 8082 
+          filterChain:
+            filter:
+              name: "envoy.filters.network.http_connection_manager"
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.lua
+          typed_config:
+            "@type": "type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua"
+            inlineCode: |
+              function envoy_on_request(request_handle)
+
+                -- Variables for client credentials
+                local client_id = "internal"  -- Replace with your client ID
+                local client_secret = "aqMXRDJNSFIsXbTxlXoIRWZHIa0VXizN"  -- Replace with your client secret
+                local issuer = "SANTOSH"  -- Replace with your issuer
+                
+                -- Get the incoming authorization header
+                local incoming_auth = request_handle:headers():get("authorization")
+
+                -- Build the form data for the token exchange request
+                local form_data = "grant_type=urn:ietf:params:oauth:grant-type:token-exchange&" ..
+                                  "requested_token_type=urn:ietf:params:oauth:token-type:access_token&" ..
+                                  "client_id=" .. client_id .. "&" ..
+                                  "client_secret=" .. client_secret .. "&" ..
+                                  "subject_token=" .. incoming_auth .. "&" ..
+                                  "subject_issuer=" .. issuer .. "&" ..
+                                  "subject_token_type=urn:ietf:params:oauth:token-type:access_token"
+
+                -- Make an HTTP POST call to Keycloak for token exchange
+                local ok, headers, body = pcall(request_handle.httpCall, request_handle,
+                  "keycloak-token-exchange",
+                  {
+                    [":method"] = "POST",
+                    [":path"] = "/realms/master/protocol/openid-connect/token",
+                    [":authority"] = "192.168.1.40:8180",
+                    ["Content-Type"] = "application/x-www-form-urlencoded"
+                  },
+                  form_data,
+                  5000  -- Timeout in milliseconds
+                )
+
+                -- Check if the HTTP call was successful
+                if not ok or not body then
+                  request_handle:respond(
+                    { [":status"] = "403" },
+                    "Authorization failed: Unable to retrieve token"
+                  )
+                  return
+                end
+
+                -- Manually parse the JSON response
+                local token = body:match('"access_token"%s*:%s*"(.-)"')
+                if token then
+                  request_handle:headers():add("x-internal-authorization", "Bearer " .. token)
+                else
+                  -- If token is missing, return an error response
+                  request_handle:respond(
+                    { [":status"] = "403" },
+                    "Authorization failed: Access token not found in response"
+                  )
+                end
+              end
+
+    - applyTo: CLUSTER
+      match:
+        cluster:
+          service: "keycloak-token-exchange"
+      patch:
+        operation: ADD
+        value:
+          name: "keycloak-token-exchange"
+          type: STRICT_DNS
+          connect_timeout: 1s
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: "keycloak-token-exchange"
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: "192.168.1.40"  # Keycloak IP address
+                          port_value: 8180
