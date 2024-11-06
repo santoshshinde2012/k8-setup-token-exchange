@@ -9,5 +9,4 @@ spec:
     - protocol: TCP
       port: 80         # Service port
       targetPort: 8082 # Container port
-      nodePort: 30001
   type: NodePort # ClusterIP
